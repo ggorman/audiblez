@@ -12,3 +12,5 @@ chapters.txt
 *.onnx
 dist
 .venv
+**/CLAUDE.md
+eval/out-codex/

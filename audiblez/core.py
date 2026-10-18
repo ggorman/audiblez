@@ -321,27 +321,44 @@ def strfdelta(tdelta, fmt='{D:02}d {H:02}h {M:02}m {S:02}s'):
     return f.format(fmt, **values)
 
 
-def concat_wavs_with_ffmpeg(chapter_files, output_folder, filename):
+def write_wav_list(chapter_files, output_folder, filename):
     wav_list_txt = Path(output_folder) / filename.replace('.epub', '_wav_list.txt')
     with open(wav_list_txt, 'w') as f:
         for wav_file in chapter_files:
-            f.write(f"file '{wav_file}'\n")
-    concat_file_path = Path(output_folder) / filename.replace('.epub', '.tmp.mp4')
-    subprocess.run([
-        'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', wav_list_txt,
-        # '-c', 'copy',
-        '-c:a',  'libfdk_aac',
-        '-b:a',  '192k',
-        concat_file_path])
-    Path(wav_list_txt).unlink()
-    return concat_file_path
+            # absolute: the concat demuxer resolves relative entries against the list file's folder;
+            # a ' inside a quoted ffconcat path is written as '\''
+            path = str(Path(wav_file).resolve()).replace("'", "'\\''")
+            f.write(f"file '{path}'\n")
+    return wav_list_txt
+
+
+# AAC-LC encoders in order of preference; all three score PESQ-WB ~4.45 on 24 kHz mono TTS (see eval/).
+# ponytail: tried in order at encode time, because a listed encoder can still fail to start
+# (aac_at needs macOS AudioToolbox services, which sandboxes can block; libfdk_aac needs a non-free build)
+AAC_ENCODERS = [
+    ('aac_at', ['-aac_at_mode', 'cvbr', '-b:a', '64k']),
+    ('libfdk_aac', ['-b:a', '64k']),
+    ('aac', ['-b:a', '96k']),  # native aac needs 96k to match the other two at 64k
+]
+
+
+def audio_duration(file_name):
+    """Duration of the first audio stream in seconds, 0 if there is none (format duration can come from chapters)."""
+    args = ['ffprobe', '-v', 'quiet', '-select_streams', 'a:0', '-show_entries', 'stream=duration',
+            '-of', 'csv=p=0', str(file_name)]
+    out = subprocess.run(args, capture_output=True, text=True).stdout.strip()
+    try:
+        return float(out)
+    except ValueError:
+        return 0.0
 
 
 def create_m4b(chapter_files, filename, cover_image, output_folder):
-    concat_file_path = concat_wavs_with_ffmpeg(chapter_files, output_folder, filename)
     final_filename = Path(output_folder) / filename.replace('.epub', '.m4b')
+    tmp_filename = final_filename.with_suffix('.tmp.m4b')  # a failed encode must not clobber an existing .m4b
     chapters_txt_path = Path(output_folder) / "chapters.txt"
     print('Creating M4B file...')
+    expected_duration = sum(audio_duration(f) for f in chapter_files)  # before any work file is written
 
     if cover_image:
         cover_file_path = Path(output_folder) / 'cover'
@@ -356,28 +373,40 @@ def create_m4b(chapter_files, filename, cover_image, output_folder):
     else:
         cover_image_args = []
 
-    proc = subprocess.run([
-        'ffmpeg',
-        '-y',  # Overwrite output
-        
-        '-i', f'{concat_file_path}',  # Input audio
-        '-i', f'{chapters_txt_path}',  # Input chapters
-        *cover_image_args,  # Cover image (if provided)
+    wav_list_txt = write_wav_list(chapter_files, output_folder, filename)
+    try:
+        for encoder, encoder_args in AAC_ENCODERS:
+            proc = subprocess.run([
+                'ffmpeg',
+                '-y',  # Overwrite output
 
-        '-map', '0:a',  # Map audio
-        '-c:a', 'aac',  # Convert to AAC
-        '-b:a', '64k',  # Reduce bitrate for smaller size
+                '-f', 'concat', '-safe', '0', '-i', f'{wav_list_txt}',  # Input audio: chapter WAVs, joined losslessly
+                '-i', f'{chapters_txt_path}',  # Input chapters
+                *cover_image_args,  # Cover image (if provided)
 
-        '-map_metadata', '1', # Map metadata
+                '-map', '0:a',  # Map audio
+                '-c:a', encoder, *encoder_args,  # Single AAC encode
 
-        '-f', 'mp4',  # Output as M4B
-        f'{final_filename}'  # Output file
-    ])
+                '-map_metadata', '1', # Map metadata
 
-    Path(concat_file_path).unlink()
-    if proc.returncode == 0:
-        print(f'{final_filename} created. Enjoy your audiobook.')
-        print('Feel free to delete the intermediary .wav chapter files, the .m4b is all you need.')
+                '-f', 'mp4',  # Output as M4B
+                f'{tmp_filename}'  # Output file
+            ])
+            # an encoder that fails to start can still exit 0, or emit only priming packets (aac_at does)
+            if proc.returncode == 0 and expected_duration > 0 and audio_duration(tmp_filename) >= 0.99 * expected_duration:
+                break
+            print(f'Encoder {encoder} failed, trying the next one.')
+        else:
+            tmp_filename.unlink(missing_ok=True)
+            raise RuntimeError(f'ffmpeg could not encode {final_filename} with any of {[e for e, _ in AAC_ENCODERS]}')
+    finally:
+        wav_list_txt.unlink(missing_ok=True)
+        if cover_image:
+            cover_file_path.unlink(missing_ok=True)
+
+    tmp_filename.replace(final_filename)
+    print(f'{final_filename} created with {encoder}. Enjoy your audiobook.')
+    print('Feel free to delete the intermediary .wav chapter files, the .m4b is all you need.')
 
 
 def probe_duration(file_name):
