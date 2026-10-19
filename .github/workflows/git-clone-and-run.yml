@@ -22,6 +22,12 @@ jobs:
         run: audiblez Fundamental-Accessibility-Tests-Basic-Functionality-v2.0.0.epub
       - name: check m4b output file
         run: ls -lah Fundamental-Accessibility-Tests-Basic-Functionality-v2.0.0.m4b
+      - name: run markdown/text unit tests
+        run: python -m unittest discover -s test -p 'test_textdoc*.py'
+      - name: create audiobook from markdown
+        run: audiblez test/fixtures/summary.md -o md-out
+      - name: check markdown m4b has chapter titles
+        run: ffprobe -v error -show_chapters -of csv md-out/summary.m4b | grep -q 'Part 1: Background'
   #      - name: run unit-tests (unittest classes in /test)
   #        run:  poetry run python -m unittest discover test
   windows-git-clone-and-run:

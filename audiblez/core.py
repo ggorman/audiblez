@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import platform
 import re
-from io import StringIO
+import copy
 from types import SimpleNamespace
 from tabulate import tabulate
 from pathlib import Path
@@ -28,6 +28,7 @@ from ebooklib import epub
 from pick import pick
 
 sample_rate = 24000
+MISAKI_LINK = re.compile(r'\[([^\]]+)\]\(([^)]*)\)')
 
 
 def load_spacy():
@@ -70,20 +71,19 @@ def set_espeak_library():
 
 
 def main(file_path, voice, pick_manually, speed, output_folder='.',
-         max_chapters=None, max_sentences=None, selected_chapters=None, post_event=None):
+         max_chapters=None, max_sentences=None, selected_chapters=None, post_event=None, title=None, author=None):
     if post_event: post_event('CORE_STARTED')
     load_spacy()
     if output_folder != '.':
         Path(output_folder).mkdir(parents=True, exist_ok=True)
 
-    filename = Path(file_path).name
+    stem = Path(file_path).stem
 
-    extension = '.epub'
-    book = epub.read_epub(file_path)
+    book = load_book(file_path)
     meta_title = book.get_metadata('DC', 'title')
-    title = meta_title[0][0] if meta_title else ''
+    title = title or (meta_title[0][0] if meta_title else '')
     meta_creator = book.get_metadata('DC', 'creator')
-    creator = meta_creator[0][0] if meta_creator else ''
+    creator = author or (meta_creator[0][0] if meta_creator else '')
 
     cover_maybe = find_cover(book)
     cover_image = cover_maybe.get_content() if cover_maybe else b""
@@ -96,7 +96,9 @@ def main(file_path, voice, pick_manually, speed, output_folder='.',
         if pick_manually is True:
             selected_chapters = pick_chapters(document_chapters)
         else:
-            selected_chapters = find_good_chapters(document_chapters)
+            selected_chapters = default_chapters(book, document_chapters)
+    if not selected_chapters:
+        raise ValueError(f'No readable text found in {file_path}')
     print_selected_chapters(document_chapters, selected_chapters)
     texts = [c.extracted_text for c in selected_chapters]
 
@@ -117,12 +119,15 @@ def main(file_path, voice, pick_manually, speed, output_folder='.',
     pipeline = KPipeline(lang_code=voice[0])  # a for american or b for british etc.
 
     chapter_wav_files = []
+    titles = toc_titles(book)
+    chapter_titles = {}
     for i, chapter in enumerate(selected_chapters, start=1):
         if max_chapters and i > max_chapters: break
         text = chapter.extracted_text
         xhtml_file_name = chapter.get_name().replace(' ', '_').replace('/', '_').replace('\\', '_')
-        chapter_wav_path = Path(output_folder) / filename.replace(extension, f'_chapter_{i}_{voice}_{xhtml_file_name}.wav')
+        chapter_wav_path = Path(output_folder) / f'{stem}_chapter_{i}_{voice}_{xhtml_file_name}.wav'
         chapter_wav_files.append(chapter_wav_path)
+        chapter_titles[chapter_wav_path] = getattr(chapter, 'title', '') or titles.get(chapter.get_name()) or f'Chapter {i}'
         if Path(chapter_wav_path).exists():
             print(f'File for chapter {i} already exists. Skipping')
             stats.processed_chars += len(text)
@@ -133,9 +138,8 @@ def main(file_path, voice, pick_manually, speed, output_folder='.',
             print(f'Skipping empty chapter {i}')
             chapter_wav_files.remove(chapter_wav_path)
             continue
-        if i == 1:
-            # add intro text
-            text = f'{title} – {creator}.\n\n' + text
+        if i == 1 and (intro := ' – '.join(x for x in (title, creator) if x)):
+            text = f'{intro}.\n\n' + text
         start_time = time.time()
         if post_event: post_event('CORE_CHAPTER_STARTED', chapter_index=chapter.chapter_index)
         audio_segments = gen_audio_segments(
@@ -154,9 +158,42 @@ def main(file_path, voice, pick_manually, speed, output_folder='.',
             chapter_wav_files.remove(chapter_wav_path)
 
     if has_ffmpeg:
-        create_index_file(title, creator, chapter_wav_files, output_folder)
-        create_m4b(chapter_wav_files, filename, cover_image, output_folder)
+        create_index_file(title, creator, chapter_wav_files, output_folder,
+                          [chapter_titles[f] for f in chapter_wav_files])
+        create_m4b(chapter_wav_files, stem, cover_image, output_folder)
         if post_event: post_event('CORE_FINISHED')
+
+
+def load_book(file_path):
+    """Open an .epub, or build an in-memory one from a .md / .txt file (see textdoc.py)."""
+    suffix = Path(file_path).suffix.lower()
+    if suffix == '.epub':
+        return epub.read_epub(file_path)
+    if suffix in ('.md', '.txt'):
+        from audiblez.textdoc import load_text_book
+        return load_text_book(file_path)
+    raise ValueError(f'Unsupported file type {suffix!r}: audiblez reads .epub, .md and .txt')
+
+
+def default_chapters(book, document_chapters):
+    if getattr(book, 'audiblez_text_source', False):  # .md/.txt sections are all real content
+        return [c for c in document_chapters if c.extracted_text.strip()]
+    return find_good_chapters(document_chapters)
+
+
+def toc_titles(book):
+    """Map document file name -> title from the epub table of contents."""
+    titles = {}
+
+    def walk(entries):
+        for entry in entries:
+            if isinstance(entry, (tuple, list)):
+                walk(entry)
+            elif getattr(entry, 'href', None) and getattr(entry, 'title', None):
+                titles.setdefault(entry.href.split('#')[0], entry.title)
+
+    walk(book.toc)
+    return titles
 
 
 def find_cover(book):
@@ -259,15 +296,29 @@ def find_document_chapters_and_extract_texts(book):
         xml = chapter.get_body_content()
         soup = BeautifulSoup(xml, features='lxml')
         chapter.extracted_text = ''
-        html_content_tags = ['title', 'p', 'h1', 'h2', 'h3', 'h4', 'li']
-        for text in [c.text.strip() for c in soup.find_all(html_content_tags) if c.text]:
-            if not text.endswith('.'):
+        html_content_tags = ['title', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li']
+        for text in [block_text(c) for c in soup.find_all(html_content_tags)]:
+            if not text:
+                continue
+            if not re.search(r'[.!?:;…]["”’\')\]]*$', text):
                 text += '.'
             chapter.extracted_text += text + '\n'
         document_chapters.append(chapter)
     for i, c in enumerate(document_chapters):
         c.chapter_index = i  # this is used in the UI to identify chapters
     return document_chapters
+
+
+def block_text(element):
+    """Text of one block. A list item contributes only its own text: nested lists and paragraphs inside it
+    are blocks of their own, so taking li.text would read them twice."""
+    own_blocks = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'ul', 'ol']  # read separately by the caller
+    if element.name == 'li' and element.find(own_blocks):
+        element = copy.copy(element)  # wrappers such as <div> keep their text; only separately-read blocks go
+        for nested in element.find_all(own_blocks):
+            nested.decompose()
+    # misaki reads [text](target) as a pronunciation override, so never let that shape reach it
+    return MISAKI_LINK.sub(r'\1', element.text.strip())
 
 
 def is_chapter(c):
@@ -321,8 +372,8 @@ def strfdelta(tdelta, fmt='{D:02}d {H:02}h {M:02}m {S:02}s'):
     return f.format(fmt, **values)
 
 
-def write_wav_list(chapter_files, output_folder, filename):
-    wav_list_txt = Path(output_folder) / filename.replace('.epub', '_wav_list.txt')
+def write_wav_list(chapter_files, output_folder, stem):
+    wav_list_txt = Path(output_folder) / f'{stem}_wav_list.txt'
     with open(wav_list_txt, 'w') as f:
         for wav_file in chapter_files:
             # absolute: the concat demuxer resolves relative entries against the list file's folder;
@@ -353,8 +404,8 @@ def audio_duration(file_name):
         return 0.0
 
 
-def create_m4b(chapter_files, filename, cover_image, output_folder):
-    final_filename = Path(output_folder) / filename.replace('.epub', '.m4b')
+def create_m4b(chapter_files, stem, cover_image, output_folder):
+    final_filename = Path(output_folder) / f'{stem}.m4b'
     tmp_filename = final_filename.with_suffix('.tmp.m4b')  # a failed encode must not clobber an existing .m4b
     chapters_txt_path = Path(output_folder) / "chapters.txt"
     print('Creating M4B file...')
@@ -373,7 +424,7 @@ def create_m4b(chapter_files, filename, cover_image, output_folder):
     else:
         cover_image_args = []
 
-    wav_list_txt = write_wav_list(chapter_files, output_folder, filename)
+    wav_list_txt = write_wav_list(chapter_files, output_folder, stem)
     try:
         for encoder, encoder_args in AAC_ENCODERS:
             proc = subprocess.run([
@@ -415,35 +466,17 @@ def probe_duration(file_name):
     return float(proc.stdout.strip())
 
 
-def create_index_file(title, creator, chapter_mp3_files, output_folder):
+def ffmeta_escape(value):
+    return re.sub(r'([=;#\\\n])', r'\\\1', value)
+
+
+def create_index_file(title, creator, chapter_mp3_files, output_folder, chapter_titles=None):
+    chapter_titles = chapter_titles or [f'Chapter {i}' for i in range(len(chapter_mp3_files))]
     with open(Path(output_folder) / "chapters.txt", "w", encoding="utf-8") as f:
-        f.write(f";FFMETADATA1\ntitle={title}\nartist={creator}\n\n")
+        f.write(f";FFMETADATA1\ntitle={ffmeta_escape(title)}\nartist={ffmeta_escape(creator)}\n\n")
         start = 0
-        i = 0
-        for c in chapter_mp3_files:
+        for c, chapter_title in zip(chapter_mp3_files, chapter_titles):
             duration = probe_duration(c)
             end = start + (int)(duration * 1000)
-            f.write(f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={start}\nEND={end}\ntitle=Chapter {i}\n\n")
-            i += 1
+            f.write(f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={start}\nEND={end}\ntitle={ffmeta_escape(chapter_title)}\n\n")
             start = end
-
-
-def unmark_element(element, stream=None):
-    """auxiliarry function to unmark markdown text"""
-    if stream is None:
-        stream = StringIO()
-    if element.text:
-        stream.write(element.text)
-    for sub in element:
-        unmark_element(sub, stream)
-    if element.tail:
-        stream.write(element.tail)
-    return stream.getvalue()
-
-
-def unmark(text):
-    """Unmark markdown text"""
-    Markdown.output_formats["plain"] = unmark_element  # patching Markdown
-    __md = Markdown(output_format="plain")
-    __md.stripTopLevelTags = False
-    return __md.convert(text)

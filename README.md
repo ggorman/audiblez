@@ -121,15 +121,36 @@ Sometimes you want to manually select which chapters/sections in the e-book to r
 To do so, you can use `--pick` to interactively choose the chapters to convert (without running the GUI).
 
 
+## Markdown and text files
+
+Besides `.epub`, audiblez reads Markdown (`.md`) and plain text (`.txt`):
+
+```
+audiblez summary.md -v bf_emma
+audiblez notes.txt -v af_sky --title "My Notes" --author "Jane Doe"
+```
+
+- **Chapters** come from headings. A single `#` heading is the book title and chapters start at the next level (usually `##`). Several `#` headings each start a chapter. With no headings, the whole file is one chapter. In `.txt` files, lines starting with `#` are headings and nothing else is treated as markup.
+- **Title and author** come from `--title`/`--author`, then a YAML front-matter block (`title:`, `author:`), then a byline under the title (e.g. `Ann Smith and Bo Li — arXiv:…`), then the `#` heading or file name.
+- **Lines under the title that aren't sentences** (bylines, "10-minute summary | 1,450 words") are skipped rather than read aloud. Introductory prose is kept.
+- **Formatting** (bold, links, lists) is read as plain text. Code blocks, tables and images are skipped.
+- **Maths** (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`) is not read aloud. Each affected paragraph gets "See the document for equations." added instead.
+
+If you generate the text with an LLM, asking for speech-ready output gives the best audio. For example, add to your prompt:
+
+> Write plain prose for text-to-speech: no Markdown formatting, tables, code, URLs or citations; write equations out in words.
+
+Ask for a word count rather than a duration. Kokoro reads at roughly 120 words per minute at `-s 1.0`, and LLM length estimates can be well off. One "10-minute summary" claimed 1,450 words, contained 2,600 and ran 21 minutes.
+
 ## Help page
 
 For all the options available, you can check the help page `audiblez --help`:
 
 ```
-usage: audiblez [-h] [-v VOICE] [-p] [-s SPEED] [-c] [-o FOLDER] epub_file_path
+usage: audiblez [-h] [-v VOICE] [-p] [-s SPEED] [-c] [-o FOLDER] [--title TITLE] [--author AUTHOR] epub_file_path
 
 positional arguments:
-  epub_file_path        Path to the epub file
+  epub_file_path        Path to an .epub, .md or .txt file
 
 options:
   -h, --help            show this help message and exit
@@ -141,9 +162,12 @@ options:
   -c, --cuda            Use GPU via Cuda in Torch if available
   -o FOLDER, --output FOLDER
                         Output folder for the audiobook and temporary files
+  --title TITLE         Audiobook title (overrides the book metadata)
+  --author AUTHOR       Audiobook author (overrides the book metadata)
 
 example:
-  audiblez book.epub -l en-us -v af_sky
+  audiblez book.epub -v af_sky
+  audiblez summary.md -v bf_emma --author "Jane Doe"
 
 to use the GUI, run:
   audiblez-ui

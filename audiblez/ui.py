@@ -122,20 +122,10 @@ class MainWindow(wx.Frame):
         top_sizer = wx.BoxSizer(wx.HORIZONTAL)
         top_panel.SetSizer(top_sizer)
 
-        # Open Epub button
-        open_epub_button = wx.Button(top_panel, label="📁 Open EPUB")
+        # Open book button (.epub, .md, .txt)
+        open_epub_button = wx.Button(top_panel, label="📁 Open EPUB / MD / TXT")
         open_epub_button.Bind(wx.EVT_BUTTON, self.on_open)
         top_sizer.Add(open_epub_button, 0, wx.ALL, 5)
-
-        # Open Markdown .md
-        # open_md_button = wx.Button(top_panel, label="📁 Open Markdown (.md)")
-        # open_md_button.Bind(wx.EVT_BUTTON, self.on_open)
-        # top_sizer.Add(open_md_button, 0, wx.ALL, 5)
-
-        # Open .txt
-        # open_txt_button = wx.Button(top_panel, label="📁 Open .txt")
-        # open_txt_button.Bind(wx.EVT_BUTTON, self.on_open)
-        # top_sizer.Add(open_txt_button, 0, wx.ALL, 5)
 
         # Open PDF
         # open_pdf_button = wx.Button(top_panel, label="📁 Open PDF")
@@ -381,9 +371,8 @@ class MainWindow(wx.Frame):
         self.selected_file_path = file_path
         print(f"Opening file: {file_path}")  # Do something with the filepath (e.g., parse the EPUB)
 
-        from ebooklib import epub
-        from audiblez.core import find_document_chapters_and_extract_texts, find_good_chapters, find_cover
-        book = epub.read_epub(file_path)
+        from audiblez.core import find_document_chapters_and_extract_texts, default_chapters, find_cover, load_book
+        book = load_book(file_path)
         meta_title = book.get_metadata('DC', 'title')
         self.selected_book_title = meta_title[0][0] if meta_title else ''
         meta_creator = book.get_metadata('DC', 'creator')
@@ -391,10 +380,13 @@ class MainWindow(wx.Frame):
         self.selected_book = book
 
         self.document_chapters = find_document_chapters_and_extract_texts(book)
-        good_chapters = find_good_chapters(self.document_chapters)
+        good_chapters = default_chapters(book, self.document_chapters)
+        if not good_chapters:
+            wx.MessageBox(f"No readable text found in {file_path}.", "Nothing to read")
+            return
         self.selected_chapter = good_chapters[0]
         for chapter in self.document_chapters:
-            chapter.short_name = chapter.get_name().replace('.xhtml', '').replace('xhtml/', '').replace('.html', '').replace('Text/', '')
+            chapter.short_name = getattr(chapter, 'title', '') or chapter.get_name().replace('.xhtml', '').replace('xhtml/', '').replace('.html', '').replace('Text/', '')
             chapter.is_selected = chapter in good_chapters
 
         self.create_layout_for_ebook(self.splitter)
@@ -534,7 +526,7 @@ class MainWindow(wx.Frame):
         self.core_thread.start()
 
     def on_open(self, event):
-        with wx.FileDialog(self, "Open EPUB File", wildcard="*.epub", style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dialog:
+        with wx.FileDialog(self, "Open book", wildcard="E-books and text (*.epub;*.md;*.txt)|*.epub;*.md;*.txt", style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dialog:
             if dialog.ShowModal() == wx.ID_CANCEL:
                 return
             file_path = dialog.GetPath()

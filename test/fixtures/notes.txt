@@ -1,0 +1,10 @@
+These notes start with an introduction
+that wraps across two lines.
+
+# First heading
+
+Plain text needs no markup, and a price of $5 stays.
+
+# Second heading
+
+The last paragraph.
