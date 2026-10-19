@@ -27,7 +27,8 @@ jobs:
       - name: create audiobook from markdown
         run: audiblez test/fixtures/summary.md -o md-out
       - name: check markdown m4b has chapter titles
-        run: ffprobe -v error -show_chapters -of csv md-out/summary.m4b | grep -q 'Part 1: Background'
+        run: |
+          ffprobe -v error -show_chapters -of csv md-out/summary.m4b | grep -q 'Part 1: Background'
   #      - name: run unit-tests (unittest classes in /test)
   #        run:  poetry run python -m unittest discover test
   windows-git-clone-and-run:
